@@ -903,10 +903,11 @@ async def test_proxy(proxy):
     try:
         t0 = time.time()
         params = {'cc': test_card, 'site': test_site_url, 'proxy': proxy}
-        # Use a short timeout so dead proxies fail fast (full checkout is ≤30 s)
-        raw = await asyncio.wait_for(call_checker_api(params), timeout=30)
+        # 10-second window: dead proxies return an error quickly; live proxies
+        # will be mid-checkout (15-30 s) when the timeout fires.
+        raw = await asyncio.wait_for(call_checker_api(params), timeout=10)
         elapsed_ms = (time.time() - t0) * 1000
-        # A valid response must carry a Status key (True = Approved, False = Dead)
+        # A valid response must carry a Status key (True = Approved/Dead, False = error)
         if 'Status' not in raw:
             return {'proxy': proxy, 'status': 'dead'}
         response_msg = (raw.get('Response', '') or raw.get('error', '')).lower()
@@ -914,7 +915,7 @@ async def test_proxy(proxy):
         # Detect proxy-specific failures surfaced by the API
         proxy_keywords = (
             'proxy dead', 'proxy error', 'invalid proxy format', 'no proxy',
-            'proxy', 'socks', '407', 'tunnel connection failed',
+            '407', 'tunnel connection failed',
         )
         if any(kw in response_msg or kw in gateway_msg for kw in proxy_keywords):
             return {'proxy': proxy, 'status': 'dead'}
@@ -924,7 +925,12 @@ async def test_proxy(proxy):
             elapsed_ms if prev is None else 0.7 * prev + 0.3 * elapsed_ms
         )
         return {'proxy': proxy, 'status': 'alive'}
-    except (asyncio.TimeoutError, Exception):
+    except asyncio.TimeoutError:
+        # Timeout means the checkout is still processing → proxy is alive and
+        # responding. Record a high latency so the bot prefers faster proxies.
+        _proxy_speed_cache[proxy] = _proxy_speed_cache.get(proxy, 10000)
+        return {'proxy': proxy, 'status': 'alive'}
+    except Exception:
         return {'proxy': proxy, 'status': 'dead'}
 
 # ========== PROGRESS / RESULTS ==========
