@@ -268,6 +268,9 @@ def extract_clean_response(message):
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
     gateway = "UNKNOWN"
     total_price = "0.00"
+    # product_price is set once after fetch_products and never overwritten by checkout
+    # totals — it is used as the stable fallback in all error returns.
+    product_price = "0.00"
     currency = "USD"
 
     ourl = site_url if site_url.startswith("http") else f"https://{site_url}"
@@ -306,10 +309,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         if not variant_id:
             info = await fetch_products(ourl, proxy_str)
             if isinstance(info, tuple) and info[0] is False:
-                return False, info[1], gateway, total_price, currency
+                return False, info[1], gateway, product_price, currency
             variant_id = info["variant_id"]
-            # Store product price so error paths after this point never return 0.00
-            total_price = info.get("price", total_price)
+            # Store product price immediately; product_price is never overwritten by
+            # checkout totals so it serves as the stable fallback for all error paths.
+            product_price = info.get("price", "0.00")
+            total_price = product_price
 
         async with AsyncSession(impersonate="chrome120", verify=False) as session:
             url      = ourl
@@ -1075,7 +1080,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "Unknown Result", gateway, total_price, currency
 
     except Exception as e:
-        return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency
+        return False, f"Error Processing Card: {str(e)}", gateway, product_price if product_price != "0.00" else total_price, currency
 
 
 def parse_cc_string(cc_string):
@@ -1156,7 +1161,7 @@ async def shopify_checker():
             gateway = DEFAULT_GATEWAY
 
         try:
-            price_float = float(price) if str(price).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.0
+            price_float = float(price)
         except (ValueError, TypeError):
             price_float = 0.0
 
