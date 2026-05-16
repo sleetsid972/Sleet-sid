@@ -461,45 +461,84 @@ def load_sites():
 def load_proxies():
     return get_file_lines(PROXY_FILE)
 
+# ========== PROXY SPEED CACHE ==========
+_proxy_speed_cache: dict = {}  # {proxy_str: avg_response_ms}
+
+def _make_proxy_dict(proxy_str: str) -> dict:
+    """Convert a proxy string to a curl_cffi-compatible proxies dict."""
+    if not proxy_str:
+        return {}
+    if "://" in proxy_str:
+        return {"http": proxy_str, "https": proxy_str}
+    parts = proxy_str.split(":")
+    if len(parts) == 2:
+        url = f"http://{parts[0]}:{parts[1]}"
+    elif len(parts) == 4:
+        ip, port, user, password = parts
+        url = f"http://{user}:{password}@{ip}:{port}"
+    else:
+        return {}
+    return {"http": url, "https": url}
+
+def _choose_fastest_proxies(proxies: list, n: int = 3) -> list:
+    """Return up to *n* proxies sorted by speed (fastest first).
+    Unrated proxies are placed after rated ones."""
+    rated = [(p, _proxy_speed_cache[p]) for p in proxies if p in _proxy_speed_cache]
+    unrated = [p for p in proxies if p not in _proxy_speed_cache]
+    rated.sort(key=lambda x: x[1])
+    ordered = [p for p, _ in rated] + unrated
+    return ordered[:n] if ordered else []
+
 # ========== PRICE-BASED SITE CACHE ==========
 _site_price_cache: dict = {}   # {site_url: (timestamp, min_price_or_none)}
 _PRICE_CACHE_TTL = 3600        # 1 hour
 
 async def _fetch_cheapest_price(site_url: str) -> float | None:
-    """Fetch cheapest available product price for site_url. Returns None on failure."""
-    try:
-        domain = site_url if site_url.startswith("http") else f"https://{site_url}"
-        proxies_pool = load_proxies()
-        proxy_str = random.choice(proxies_pool) if proxies_pool else None
-        proxies_dict = {}
-        if proxy_str:
-            parts = proxy_str.split(":")
-            if len(parts) == 2:
-                proxies_dict = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
-            elif len(parts) == 4:
-                ip, port, user, password = parts
-                proxies_dict = {"http": f"http://{user}:{password}@{ip}:{port}", "https": f"http://{user}:{password}@{ip}:{port}"}
-        from curl_cffi.requests import AsyncSession as _AS
-        async with _AS(impersonate="chrome120", verify=False) as session:
-            resp = await session.get(f"{domain}/products.json", proxies=proxies_dict or None, timeout=10)
-            if resp.status_code != 200:
-                return None
-            data = json.loads(resp.text)
-            products = data.get("products", [])
-            min_price = None
-            for product in products:
-                for variant in product.get("variants", []):
-                    if not variant.get("available", True):
-                        continue
-                    try:
-                        p = float(str(variant.get("price", "0")).replace(",", ""))
-                        if min_price is None or p < min_price:
-                            min_price = p
-                    except (ValueError, TypeError):
-                        continue
-            return min_price
-    except Exception:
-        return None
+    """Fetch cheapest available product price for site_url.
+    Retries with up to 3 fastest proxies. Returns None on failure."""
+    domain = site_url if site_url.startswith("http") else f"https://{site_url}"
+    proxies_pool = load_proxies()
+    candidates = _choose_fastest_proxies(proxies_pool, n=3) if proxies_pool else [None]
+    if not candidates:
+        candidates = [None]
+
+    from curl_cffi.requests import AsyncSession as _AS
+    for proxy_str in candidates:
+        try:
+            proxies_dict = _make_proxy_dict(proxy_str) if proxy_str else {}
+            async with _AS(impersonate="chrome120", verify=False) as session:
+                t0 = time.time()
+                resp = await session.get(
+                    f"{domain}/products.json",
+                    proxies=proxies_dict or None,
+                    timeout=15,
+                )
+                elapsed_ms = (time.time() - t0) * 1000
+                if proxy_str:
+                    # Update speed cache with exponential moving average
+                    prev = _proxy_speed_cache.get(proxy_str)
+                    _proxy_speed_cache[proxy_str] = (
+                        elapsed_ms if prev is None else 0.7 * prev + 0.3 * elapsed_ms
+                    )
+                if resp.status_code != 200:
+                    continue
+                data = json.loads(resp.text)
+                products = data.get("products", [])
+                min_price = None
+                for product in products:
+                    for variant in product.get("variants", []):
+                        if not variant.get("available", True):
+                            continue
+                        try:
+                            p = float(str(variant.get("price", "0")).replace(",", ""))
+                            if min_price is None or p < min_price:
+                                min_price = p
+                        except (ValueError, TypeError):
+                            continue
+                return min_price
+        except Exception:
+            continue
+    return None
 
 async def get_site_cheapest_price(site_url: str) -> float | None:
     """Return cached cheapest price or fetch if stale/missing."""
@@ -537,9 +576,15 @@ async def warm_price_cache(sites: list, notify_chat_id: int = None):
     _cache_warmup_total = len(sites)
     _cache_warmup_done = 0
 
-    batch = 10
+    sem = asyncio.Semaphore(15)
+
+    async def _fetch_with_sem(site):
+        async with sem:
+            return await get_site_cheapest_price(site)
+
+    batch = 30
     for i in range(0, len(sites), batch):
-        tasks = [get_site_cheapest_price(s) for s in sites[i:i+batch]]
+        tasks = [_fetch_with_sem(s) for s in sites[i:i+batch]]
         await asyncio.gather(*tasks, return_exceptions=True)
         _cache_warmup_done = min(i + batch, len(sites))
         await asyncio.sleep(0.5)
@@ -556,15 +601,19 @@ async def warm_price_cache(sites: list, notify_chat_id: int = None):
             and _site_price_cache[site][1] is not None
             and min_p <= _site_price_cache[site][1] <= max_p
         )
-        try:
-            await bot.send_message(
-                notify_chat_id,
-                premium_emoji(
-                    f"✅ <b>Cache ready!</b> <b>{matched}</b> sites match "
-                    f"<b>{flt['name']}</b>. You can now check cards."
-                ),
-                parse_mode='html',
+        if matched == 0 and ACTIVE_FILTER != "all":
+            msg = (
+                f"⚠️ <b>No sites could be cached for {flt['name']}.</b>\n\n"
+                f"This usually means all proxies failed to reach <code>/products.json</code>.\n"
+                f"Check your proxies with /proxy and /proxyspeed."
             )
+        else:
+            msg = (
+                f"✅ <b>Cache ready!</b> <b>{matched}</b> sites match "
+                f"<b>{flt['name']}</b>. You can now check cards."
+            )
+        try:
+            await bot.send_message(notify_chat_id, premium_emoji(msg), parse_mode='html')
         except Exception:
             pass
 
@@ -832,11 +881,18 @@ async def test_proxy(proxy):
     test_card = "5154623245618097|03|2032|156"
     test_site_url = "https://riverbendhomedev.myshopify.com"
     try:
+        t0 = time.time()
         params = {'cc': test_card, 'site': test_site_url, 'proxy': proxy}
         raw = await call_checker_api(params)
+        elapsed_ms = (time.time() - t0) * 1000
         response_msg = raw.get('Response', '').lower()
         if 'proxy dead' in response_msg or 'invalid proxy format' in response_msg or 'no proxy' in response_msg:
             return {'proxy': proxy, 'status': 'dead'}
+        # Record speed only for alive proxies
+        prev = _proxy_speed_cache.get(proxy)
+        _proxy_speed_cache[proxy] = (
+            elapsed_ms if prev is None else 0.7 * prev + 0.3 * elapsed_ms
+        )
         return {'proxy': proxy, 'status': 'alive'}
     except Exception:
         return {'proxy': proxy, 'status': 'dead'}
@@ -1930,7 +1986,14 @@ async def check_command(event):
     await status_msg.edit(premium_emoji(f"🫦 Starting check for {total_cards} cards...\n{filter_info}\n💰 Credits: {user_credits} (Will deduct 1 per card)"), parse_mode='html')
 
     session_key = f"{user_id}_{status_msg.id}"
-    active_sessions[session_key] = {'paused': False}
+    stop_event   = asyncio.Event()
+    paused_event = asyncio.Event()
+    # Store events so pause/resume/stop callbacks can reach them
+    active_sessions[session_key] = {
+        'paused': False,
+        'stop_event': stop_event,
+        'paused_event': paused_event,
+    }
 
     all_results = {
         'charged': [],
@@ -1945,54 +2008,68 @@ async def check_command(event):
     await update_progress(user_id, status_msg.id, all_results, 0)
 
     try:
-        queue = asyncio.Queue()
+        card_queue   = asyncio.Queue()
+        result_queue = asyncio.Queue()  # results fed to the single updater task
         for card in cards:
-            queue.put_nowait(card)
-
-        last_update_count = 0
-        last_update_time = time.time()
-        UPDATE_EVERY_CARDS = 100
-        UPDATE_EVERY_SECS = 5
+            card_queue.put_nowait(card)
 
         async def worker():
-            nonlocal last_update_count, last_update_time
-            while not queue.empty() and session_key in active_sessions:
-                session_state = active_sessions.get(session_key)
-                if not session_state:
+            while not card_queue.empty() and not stop_event.is_set():
+                # Honour pause
+                while paused_event.is_set() and not stop_event.is_set():
+                    await asyncio.sleep(0.5)
+                if stop_event.is_set():
                     break
-                while session_state.get('paused', False):
-                    await asyncio.sleep(1)
-                    session_state = active_sessions.get(session_key)
-                    if not session_state:
-                        return
 
                 try:
-                    card = queue.get_nowait()
+                    card = card_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
                 current_sites = filtered_sites or load_sites()
                 current_proxies = load_proxies()
                 if not current_sites or not current_proxies:
+                    card_queue.task_done()
                     break
 
                 # Pre-deduct credit before API call
                 deducted, _ = await deduct_credit(user_id)
                 if not deducted:
-                    break  # no more credits
+                    card_queue.task_done()
+                    break
 
                 try:
                     async with _api_semaphore:
-                        res = await check_card_with_retry(card, current_sites, current_proxies, max_retries=1)
+                        res = await asyncio.wait_for(
+                            check_card_with_retry(card, current_sites, current_proxies, max_retries=1),
+                            timeout=125,
+                        )
+                except asyncio.CancelledError:
+                    await add_credits(user_id, 1)
+                    card_queue.task_done()
+                    return
                 except Exception as exc:
                     await add_credits(user_id, 1)  # refund on exception
-                    all_results['dead'].append({'card': card, 'message': str(exc), 'gateway': 'Unknown', 'price': '-', 'site': 'Unknown'})
-                    all_results['checked'] += 1
-                    queue.task_done()
-                    continue
+                    res = {'card': card, 'status': 'Dead', 'message': str(exc),
+                           'gateway': 'Unknown', 'price': '-', 'site': 'Unknown'}
 
                 if res.get('refund_credit'):
                     await add_credits(user_id, 1)
+
+                await result_queue.put(res)
+                card_queue.task_done()
+
+        async def updater():
+            """Single task that drains result_queue and edits the progress message
+            at most once every 2 seconds to avoid flood limits."""
+            last_edit_time = 0.0
+            while True:
+                try:
+                    res = await asyncio.wait_for(result_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if stop_event.is_set() and result_queue.empty():
+                        break
+                    continue
 
                 all_results['checked'] += 1
 
@@ -2004,38 +2081,35 @@ async def check_command(event):
                         await send_log_to_channel(res['message'][:150], res.get('gateway', 'Unknown'), res.get('price', '-'), username, user_id)
                     except Exception:
                         await send_log_to_channel(res['message'][:150], res.get('gateway', 'Unknown'), res.get('price', '-'), str(user_id), user_id)
-                    await send_realtime_hit_to_user(user_id, "CHARGED", card, res['message'][:150], res.get('gateway', 'Unknown'), res.get('price', '-'))
+                    await send_realtime_hit_to_user(user_id, "CHARGED", res['card'], res['message'][:150], res.get('gateway', 'Unknown'), res.get('price', '-'))
                 elif res['status'] == 'Approved':
                     all_results['approved'].append(res)
-                    await send_realtime_hit_to_user(user_id, "LIVE", card, res['message'][:150], res.get('gateway', 'Unknown'), res.get('price', '-'))
+                    await send_realtime_hit_to_user(user_id, "LIVE", res['card'], res['message'][:150], res.get('gateway', 'Unknown'), res.get('price', '-'))
                 else:
                     all_results['dead'].append(res)
 
-                queue.task_done()
+                result_queue.task_done()
 
-                # Update every 100 cards OR every 5 seconds, whichever comes first
+                # Throttle edits: at most once per 2 seconds
                 now = time.time()
-                cards_since = all_results['checked'] - last_update_count
-                time_since = now - last_update_time
-                if cards_since >= UPDATE_EVERY_CARDS or time_since >= UPDATE_EVERY_SECS:
-                    last_update_count = all_results['checked']
-                    last_update_time = now
-                    if session_key in active_sessions:
-                        try:
-                            await update_progress(user_id, status_msg.id, all_results, all_results['checked'])
-                        except Exception:
-                            pass
+                if now - last_edit_time >= 2.0 and session_key in active_sessions:
+                    try:
+                        await update_progress(user_id, status_msg.id, all_results, all_results['checked'])
+                        last_edit_time = now
+                    except Exception:
+                        pass
 
-        workers = [asyncio.create_task(worker()) for _ in range(10)]
+                # All done?
+                if all_results['checked'] >= total_cards and result_queue.empty():
+                    break
 
-        while workers:
-            if session_key not in active_sessions:
-                for w in workers:
-                    if not w.done():
-                        w.cancel()
-                break
-            done, pending = await asyncio.wait(workers, timeout=1.0)
-            workers = list(pending)
+        worker_tasks  = [asyncio.create_task(worker()) for _ in range(10)]
+        updater_task  = asyncio.create_task(updater())
+
+        # Wait for all workers
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        stop_event.set()             # signal updater to finish draining
+        await updater_task           # wait for updater to flush remaining results
 
         if session_key in active_sessions:
             await update_progress(user_id, status_msg.id, all_results, all_results['checked'])
@@ -2097,6 +2171,27 @@ async def proxy_command(event):
     except Exception as e:
         await status_msg.edit(premium_emoji(f"❌ An error occurred: {e}"), parse_mode='html')
 
+# ========== PROXY SPEED COMMAND ==========
+
+@bot.on(events.NewMessage(pattern='/proxyspeed'))
+async def proxyspeed_command(event):
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        return await event.reply(premium_emoji("❌ <b>Admin only command!</b>"), parse_mode='html')
+
+    if not _proxy_speed_cache:
+        return await event.reply(premium_emoji(
+            "⏳ <b>No speed data yet.</b>\n\nRun /proxy first to measure proxy speeds."
+        ), parse_mode='html')
+
+    rated = sorted(_proxy_speed_cache.items(), key=lambda x: x[1])[:10]
+    lines = ["<b>🚀 Top-10 Fastest Proxies</b>", "<b>━━━━━━━━━━━━━━━━━</b>"]
+    for i, (proxy, ms) in enumerate(rated, 1):
+        lines.append(f"{i}. <code>{proxy}</code> — <b>{ms:.0f}ms</b>")
+    lines.append("<b>━━━━━━━━━━━━━━━━━</b>")
+    lines.append(f"📊 Total rated proxies: <b>{len(_proxy_speed_cache)}</b>")
+    await event.reply(premium_emoji("\n".join(lines)), parse_mode='html')
+
 @bot.on(events.NewMessage(pattern='/site'))
 async def site_command(event):
     user_id = event.sender_id
@@ -2117,13 +2212,25 @@ async def site_command(event):
 
     alive_sites = []
     dead_sites = []
-    batch_size = 10
+    batch_size = 50
+    _site_test_sem = asyncio.Semaphore(20)
+
+    async def _test_site_bounded(site, proxy):
+        async with _site_test_sem:
+            return await test_site(site, proxy)
 
     try:
         for i in range(0, len(sites), batch_size):
             batch = sites[i:i + batch_size]
             fresh_proxies = load_proxies() or proxies
-            tasks = [test_site(site, random.choice(fresh_proxies)) for site in batch]
+            # Prefer fastest proxies for site tests
+            tasks = [
+                _test_site_bounded(
+                    site,
+                    (_choose_fastest_proxies(fresh_proxies, n=1) or [random.choice(fresh_proxies)])[0]
+                )
+                for site in batch
+            ]
             results = await asyncio.gather(*tasks)
 
             for res in results:
@@ -2356,28 +2463,39 @@ async def pause_handler(event):
     user_id = event.sender_id
     message_id = event.message_id
     session_key = f"{user_id}_{message_id}"
-    if session_key in active_sessions:
-        active_sessions[session_key]['paused'] = True
-        await event.answer(premium_emoji("⏸️ Paused"))
+    sess = active_sessions.get(session_key)
+    if sess:
+        sess['paused'] = True
+        paused_ev = sess.get('paused_event')
+        if paused_ev:
+            paused_ev.set()
+    await event.answer(premium_emoji("⏸️ Paused"))
 
 @bot.on(events.CallbackQuery(pattern=b"resume"))
 async def resume_handler(event):
     user_id = event.sender_id
     message_id = event.message_id
     session_key = f"{user_id}_{message_id}"
-    if session_key in active_sessions:
-        active_sessions[session_key]['paused'] = False
-        await event.answer(premium_emoji("▶️ Resumed"))
+    sess = active_sessions.get(session_key)
+    if sess:
+        sess['paused'] = False
+        paused_ev = sess.get('paused_event')
+        if paused_ev:
+            paused_ev.clear()
+    await event.answer(premium_emoji("▶️ Resumed"))
 
 @bot.on(events.CallbackQuery(pattern=b"stop"))
 async def stop_handler(event):
     user_id = event.sender_id
     message_id = event.message_id
     session_key = f"{user_id}_{message_id}"
-    if session_key in active_sessions:
-        del active_sessions[session_key]
-        await event.answer(premium_emoji("🛑 Stopped"))
-        await event.edit(premium_emoji("😡 **Checking stopped by user.**"))
+    sess = active_sessions.pop(session_key, None)
+    if sess:
+        stop_ev = sess.get('stop_event')
+        if stop_ev:
+            stop_ev.set()
+    await event.answer(premium_emoji("🛑 Stopped"))
+    await event.edit(premium_emoji("😡 **Checking stopped by user.**"))
 
 # ========== STARTUP ==========
 async def main():
