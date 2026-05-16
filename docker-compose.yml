@@ -1,0 +1,26 @@
+version: "3.9"
+
+# ----------------------------------------------------------------
+# Deploy this file on each VPS (VPS1, VPS2, VPS3).
+# The "api" service runs the Quart checkout API on port 5000.
+# ----------------------------------------------------------------
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+    # Mount a .env file if you need per-VPS config overrides:
+    # env_file:
+    #   - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

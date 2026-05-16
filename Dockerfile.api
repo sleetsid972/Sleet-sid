@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System deps required by curl_cffi
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl libcurl4 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir quart hypercorn "curl_cffi>=0.7.0" aiohttp python-dotenv
+
+COPY api.py queries.py ./
+
+EXPOSE 5000
+
+CMD ["python3", "api.py"]
