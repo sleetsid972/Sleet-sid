@@ -444,6 +444,88 @@ def load_sites():
 def load_proxies():
     return get_file_lines(PROXY_FILE)
 
+# ========== PRICE-BASED SITE CACHE ==========
+_site_price_cache: dict = {}   # {site_url: (timestamp, min_price_or_none)}
+_PRICE_CACHE_TTL = 3600        # 1 hour
+
+async def _fetch_cheapest_price(site_url: str) -> float | None:
+    """Fetch cheapest available product price for site_url. Returns None on failure."""
+    try:
+        domain = site_url if site_url.startswith("http") else f"https://{site_url}"
+        proxies_pool = load_proxies()
+        proxy_str = random.choice(proxies_pool) if proxies_pool else None
+        proxies_dict = {}
+        if proxy_str:
+            parts = proxy_str.split(":")
+            if len(parts) == 2:
+                proxies_dict = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
+            elif len(parts) == 4:
+                ip, port, user, password = parts
+                proxies_dict = {"http": f"http://{user}:{password}@{ip}:{port}", "https": f"http://{user}:{password}@{ip}:{port}"}
+        from curl_cffi.requests import AsyncSession as _AS
+        async with _AS(impersonate="chrome120", verify=False) as session:
+            resp = await session.get(f"{domain}/products.json", proxies=proxies_dict or None, timeout=10)
+            if resp.status_code != 200:
+                return None
+            data = json.loads(resp.text)
+            products = data.get("products", [])
+            min_price = None
+            for product in products:
+                for variant in product.get("variants", []):
+                    if not variant.get("available", True):
+                        continue
+                    try:
+                        p = float(str(variant.get("price", "0")).replace(",", ""))
+                        if min_price is None or p < min_price:
+                            min_price = p
+                    except (ValueError, TypeError):
+                        continue
+            return min_price
+    except Exception:
+        return None
+
+async def get_site_cheapest_price(site_url: str) -> float | None:
+    """Return cached cheapest price or fetch if stale/missing."""
+    now = time.time()
+    if site_url in _site_price_cache:
+        cached_ts, cached_price = _site_price_cache[site_url]
+        if now - cached_ts < _PRICE_CACHE_TTL:
+            return cached_price
+    price = await _fetch_cheapest_price(site_url)
+    _site_price_cache[site_url] = (now, price)
+    return price
+
+async def load_filtered_sites() -> list:
+    """Return sites from SITES_FILE filtered by the active price filter.
+    Sites with an unknown price (not yet cached) are included conservatively."""
+    all_sites = load_sites()
+    if ACTIVE_FILTER == "all":
+        return all_sites
+    flt = SITE_FILTERS[ACTIVE_FILTER]
+    min_p, max_p = flt["min"], flt["max"]
+    filtered = []
+    for site in all_sites:
+        price = _site_price_cache.get(site)
+        if price is None:
+            # Not cached yet — include by default so no sites are silently dropped
+            filtered.append(site)
+            continue
+        cached_ts, cached_price = price
+        if cached_price is None:
+            # Unknown price — include conservatively
+            filtered.append(site)
+        elif min_p <= cached_price <= max_p:
+            filtered.append(site)
+    return filtered
+
+async def warm_price_cache(sites: list):
+    """Background task: fetch cheapest price for all sites and populate cache."""
+    batch = 5
+    for i in range(0, len(sites), batch):
+        tasks = [get_site_cheapest_price(s) for s in sites[i:i+batch]]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.5)
+
 def add_site(site_url):
     sites = load_sites()
     if site_url in sites:
@@ -503,7 +585,7 @@ async def send_realtime_hit_to_user(user_id, hit_type, card, response_msg, gatew
 𝗖𝗼𝘂𝗻𝘁𝗿𝘆: {country} {flag}</pre>
 <b>━━━━━━━━━━━━━━━━━</b>
 
-🤖 <b>Bot By: <a href="tg://user?id=7845916818">—͟ʜᴇ𝐱ᴀ 𓃠 💮</a></b>"""
+🤖 <b>Bot made by UNKNOWNENTITY <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a> TELEGRAM</b>"""
 
     try:
         await bot.send_message(user_id, premium_emoji(message), parse_mode='html')
@@ -787,7 +869,7 @@ async def send_final_results(user_id, results):
 <blockquote>{hits_text}</blockquote>
 <b>━━━━━━━━━━━━━━━━━</b>
 
-🤖 <b>Bot By: <a href="tg://user?id=7845916818">—͟ʜᴇ𝐱ᴀ 𓃠 💮</a></b>"""
+🤖 <b>Bot made by UNKNOWNENTITY <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a> TELEGRAM</b>"""
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"shopiii_{user_id}_{timestamp}.txt"
@@ -896,6 +978,7 @@ async def start(event):
     if is_adm:
         text += """\n<b>⚡💠 𝐀𝐝𝐦𝐢𝐧 𝐂𝐨𝐦𝐦𝐚𝐧𝐝𝐬</b>
 <blockquote>• /filter - Set site price filter
+• /apistatus - Show API health & workers
 • /addpremium user_id plan_name - Add premium with plan
 • /addpremiumcustom user_id days credits - Add custom premium
 • /removepremium user - Remove premium
@@ -909,7 +992,7 @@ async def start(event):
 • /stats - Bot statistics
 • /broadcast msg - Broadcast message to ALL users</blockquote>"""
 
-    text += f"\n\n<b>━━━━━━━━━━━━━━━━━</b>\n🤖 <b>Bot By: <a href=\"tg://user?id=7845916818\">—͟ʜᴇ𝐱ᴀ 𓃠 💮</a></b>"
+    text += f"\n\n<b>━━━━━━━━━━━━━━━━━</b>\n🤖 <b>Bot made by UNKNOWNENTITY <a href=\"https://t.me/Unknow0nentity\">@Unknow0nentity</a> TELEGRAM</b>"
     await event.reply(premium_emoji(text), parse_mode='html')
 
 @bot.on(events.NewMessage(pattern='/info'))
@@ -951,7 +1034,7 @@ async def info_command(event):
 💡 Use /plans to see available plans
 💡 Contact @hexaabolte to recharge
 
-🤖 <b>Bot By: <a href=\"tg://user?id=7845916818\">—͟ʜᴇ𝐱ᴀ 𓃠</a></b>"""
+🤖 <b>Bot made by UNKNOWNENTITY <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a> TELEGRAM</b>"""
     else:
         text = f"""<b>⚠️ YOUR ACCOUNT INFO ⚠️</b>
 <b>━━━━━━━━━━━━━━━━━</b>
@@ -967,7 +1050,7 @@ async def info_command(event):
 💡 Use /redeem to activate premium key
 💡 Use /redeemcredit to activate credit key
 
-🤖 <b>Bot By: <a href=\"tg://user?id=7845916818\">—͟ʜᴇ𝐱ᴀ 𓃠</a></b>"""
+🤖 <b>Bot made by UNKNOWNENTITY <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a> TELEGRAM</b>"""
 
     await event.reply(premium_emoji(text), parse_mode='html')
 
@@ -1017,10 +1100,10 @@ async def plans_command(event):
 <b>━━━━━━━━━━━━━━━━━</b>
 
 <b>⚡ How to Purchase?</b>
-Contact: <a href="tg://user?id=7845916818">@ </a>
+Contact: <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a>
 
 <b>━━━━━━━━━━━━━━━━━</b>
-🤖 <b>Bot By: <a href="tg://user?id=7845916818">—͟ʜᴇ𝐱ᴀ 𓃠</a></b>"""
+🤖 <b>Bot made by UNKNOWNENTITY <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a> TELEGRAM</b>"""
     await event.reply(premium_emoji(text), parse_mode='html')
 
 # ========== REDEEM COMMANDS ==========
@@ -1084,7 +1167,61 @@ async def filter_command(event):
         return
 
     ACTIVE_FILTER = filter_key
-    await event.reply(premium_emoji(f"✅ <b>Filter Updated!</b>\n\nNow using: {SITE_FILTERS[ACTIVE_FILTER]['name']}"), parse_mode='html')
+    all_sites = load_sites()
+    asyncio.create_task(warm_price_cache(all_sites))
+    await event.reply(premium_emoji(f"✅ <b>Filter Updated!</b>\n\nNow using: {SITE_FILTERS[ACTIVE_FILTER]['name']}\n🔄 Warming up price cache for {len(all_sites)} sites in background..."), parse_mode='html')
+
+# ========== ADMIN - API STATUS ==========
+
+@bot.on(events.NewMessage(pattern='/apistatus'))
+async def apistatus_command(event):
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        return await event.reply(premium_emoji("❌ <b>Admin only command!</b>"), parse_mode='html')
+
+    status_msg = await event.reply(premium_emoji("🔄 <b>Checking API endpoints...</b>"), parse_mode='html')
+
+    lines = ["<b>📡 API Endpoints Status</b>", "<b>━━━━━━━━━━━━━━━━━</b>"]
+
+    for ep in API_ENDPOINTS:
+        # Derive base URL (strip /shopify suffix if present)
+        base = ep.rstrip("/")
+        if base.endswith("/shopify"):
+            base = base[:-len("/shopify")]
+
+        # Ping /health with timing
+        health_ok = False
+        ms = -1
+        try:
+            t0 = time.time()
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{base}/health") as r:
+                    health_ok = r.status == 200
+            ms = int((time.time() - t0) * 1000)
+        except Exception:
+            pass
+
+        # Query /workers
+        workers = "N/A"
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{base}/workers") as r:
+                    if r.status == 200:
+                        wdata = await r.json(content_type=None)
+                        workers = wdata.get("workers", "N/A")
+        except Exception:
+            pass
+
+        icon = "✅" if health_ok else "❌"
+        ping_str = f"{ms}ms" if ms >= 0 else "timeout"
+        lines.append(f"{icon} <code>{base}</code>")
+        lines.append(f"   Workers: <b>{workers}</b> | Ping: <b>{ping_str}</b>")
+        lines.append("<b>━━━━━━━━━━━━━━━━━</b>")
+
+    lines.append("\n🤖 <b>Bot made by UNKNOWNENTITY <a href=\"https://t.me/Unknow0nentity\">@Unknow0nentity</a> TELEGRAM</b>")
+    await status_msg.edit(premium_emoji("\n".join(lines)), parse_mode='html')
 
 # ========== ADMIN - ADD PREMIUM BY PLAN NAME ==========
 
@@ -1496,7 +1633,7 @@ async def stats_admin(event):
     msg += f"• Sites: {total_sites}\n"
     msg += f"• Proxies: {total_proxies}\n\n"
     msg += f"<b>🎯 Active Filter:</b> {SITE_FILTERS[ACTIVE_FILTER]['name']}\n\n"
-    msg += "🤖 <b>Bot By: <a href=\"tg://user?id=7845916818\">—͟ʜᴇ𝐱ᴀ 𓃠 💮</a></b>"
+    msg += '🤖 <b>Bot made by UNKNOWNENTITY <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a> TELEGRAM</b>'
 
     await event.reply(premium_emoji(msg), parse_mode='html')
 
@@ -1557,7 +1694,7 @@ async def single_cc_check(event):
     if current_credits < 1:
         return await event.reply(premium_emoji("❌ <b>Insufficient Credits!</b>\n\nYou need 1 credit to check a card.\nYour Credits: 0\n\nUse /redeemcredit CREDIT_KEY to add credits."), parse_mode='html')
 
-    sites = load_sites()
+    sites = await load_filtered_sites()
     proxies = load_proxies()
 
     if not sites:
@@ -1629,7 +1766,7 @@ async def single_cc_check(event):
 🎯 Filter: {SITE_FILTERS[ACTIVE_FILTER]['name']}
 <b>💰 Credits Left: {remaining_credits}</b>
 
-🤖 <b>Bot By: <a href="tg://user?id=7845916818">—͟ʜᴇ𝐱ᴀ 𓃠 💮</a></b>"""
+🤖 <b>Bot made by UNKNOWNENTITY <a href="https://t.me/Unknow0nentity">@Unknow0nentity</a> TELEGRAM</b>"""
 
         await status_msg.edit(premium_emoji(final_resp), parse_mode='html')
 
@@ -1688,6 +1825,10 @@ async def check_command(event):
         return await status_msg.edit(premium_emoji(f"❌ <b>Insufficient Credits!</b>\n\nYou need {total_cards} credits to check {total_cards} cards.\nYour available credits: {user_credits}\n\nUse /redeemcredit CREDIT_KEY to add more credits."), parse_mode='html')
 
     filter_info = f"🎯 Filter: {SITE_FILTERS[ACTIVE_FILTER]['name']}"
+    filtered_sites = await load_filtered_sites()
+    if not filtered_sites:
+        return await status_msg.edit(premium_emoji("❌ No sites match the active price filter. Use /filter to change the filter or /addsite to add sites."), parse_mode='html')
+
     await status_msg.edit(premium_emoji(f"🫦 Starting check for {total_cards} cards...\n{filter_info}\n💰 Credits: {user_credits} (Will deduct 1 per card)"), parse_mode='html')
 
     session_key = f"{user_id}_{status_msg.id}"
@@ -1702,16 +1843,21 @@ async def check_command(event):
         'start_time': time.time()
     }
 
+    # Show initial progress immediately so the user sees the live display right away
+    await update_progress(user_id, status_msg.id, all_results, 0)
+
     try:
         queue = asyncio.Queue()
         for card in cards:
             queue.put_nowait(card)
 
         last_update_count = 0
+        last_update_time = time.time()
         UPDATE_EVERY_CARDS = 100
+        UPDATE_EVERY_SECS = 5
 
         async def worker():
-            nonlocal last_update_count
+            nonlocal last_update_count, last_update_time
             while not queue.empty() and session_key in active_sessions:
                 session_state = active_sessions.get(session_key)
                 if not session_state:
@@ -1727,7 +1873,7 @@ async def check_command(event):
                 except asyncio.QueueEmpty:
                     break
 
-                current_sites = load_sites()
+                current_sites = filtered_sites or load_sites()
                 current_proxies = load_proxies()
                 if not current_sites or not current_proxies:
                     break
@@ -1769,8 +1915,13 @@ async def check_command(event):
 
                 queue.task_done()
 
-                if all_results['checked'] - last_update_count >= UPDATE_EVERY_CARDS:
+                # Update every 100 cards OR every 5 seconds, whichever comes first
+                now = time.time()
+                cards_since = all_results['checked'] - last_update_count
+                time_since = now - last_update_time
+                if cards_since >= UPDATE_EVERY_CARDS or time_since >= UPDATE_EVERY_SECS:
                     last_update_count = all_results['checked']
+                    last_update_time = now
                     if session_key in active_sessions:
                         try:
                             await update_progress(user_id, status_msg.id, all_results, all_results['checked'])

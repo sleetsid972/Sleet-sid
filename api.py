@@ -1101,6 +1101,23 @@ async def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/workers")
+async def worker_count():
+    """Return the number of active hypercorn worker processes."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "hypercorn"],
+            capture_output=True, text=True, timeout=3
+        )
+        pids = [p.strip() for p in result.stdout.strip().splitlines() if p.strip()]
+        # Subtract 1 for the master/current process itself
+        count = max(0, len(pids) - 1)
+        return jsonify({"workers": count})
+    except Exception:
+        return jsonify({"workers": "unknown"})
+
+
 @app.route("/shopify", methods=["GET"])
 async def shopify_checker():
     try:
@@ -1131,8 +1148,12 @@ async def shopify_checker():
         clean_response = extract_clean_response(message)
         mapped_success, mapped_response = map_response(success, clean_response)
 
+        # Normalise gateway: never expose "UNKNOWN" to the bot
+        if not gateway or gateway.upper() in ("UNKNOWN", ""):
+            gateway = "Shopify Payments"
+
         try:
-            price_float = float(price) if str(price).replace(".", "", 1).isdigit() else 0.0
+            price_float = float(price) if str(price).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.0
         except (ValueError, TypeError):
             price_float = 0.0
 
@@ -1145,12 +1166,30 @@ async def shopify_checker():
         })
 
     except Exception as e:
+        err = str(e)
+        # Classify the error into a meaningful gateway label
+        err_lower = err.lower()
+        if "proxy" in err_lower or "socks" in err_lower or "407" in err_lower:
+            err_gateway = "Proxy Error"
+            err_response = "Proxy dead"
+        elif "timeout" in err_lower or "timed out" in err_lower:
+            err_gateway = "Site Timeout"
+            err_response = "Site timeout"
+        elif "ssl" in err_lower or "certificate" in err_lower:
+            err_gateway = "SSL Error"
+            err_response = "Site SSL error"
+        elif "404" in err_lower or "not found" in err_lower:
+            err_gateway = "Site Error"
+            err_response = "Site not found"
+        else:
+            err_gateway = "Site Error"
+            err_response = f"Site error: {err[:80]}"
         return jsonify({
-            "error":    str(e),
+            "error":    err,
             "status":   False,
-            "Gateway":  "UNKNOWN",
+            "Gateway":  err_gateway,
             "Price":    0.0,
-            "Response": f"ERROR: {str(e)}",
+            "Response": err_response,
             "cc":       request.args.get("cc", ""),
         }), 500
 
