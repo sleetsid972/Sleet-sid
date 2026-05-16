@@ -489,6 +489,11 @@ def load_proxies():
 # ========== PROXY SPEED CACHE ==========
 _proxy_speed_cache: dict = {}  # {proxy_str: avg_response_ms}
 
+# ========== API CONCURRENCY SEMAPHORE ==========
+# Controls max simultaneous in-flight API requests from the bot.
+# Defined here (before any function that uses it) for clarity.
+_api_semaphore = asyncio.Semaphore(MASS_CHECK_WORKERS)
+
 def _make_proxy_dict(proxy_str: str) -> dict:
     """Convert a proxy string to a curl_cffi-compatible proxies dict."""
     if not proxy_str:
@@ -1849,7 +1854,6 @@ async def broadcast_admin(event):
     await status_msg.edit(premium_emoji(f"✅ <b>Broadcast Complete!</b>\n\nSent: {sent}\nFailed: {failed}"), parse_mode='html')
 
 # ========== SINGLE CC CHECK ==========
-_api_semaphore = asyncio.Semaphore(MASS_CHECK_WORKERS)
 
 @bot.on(events.NewMessage(pattern=r'^/cc\s+'))
 async def single_cc_check(event):
