@@ -1126,6 +1126,31 @@ async def worker_count():
         return jsonify({"workers": "unknown"})
 
 
+@app.route("/product_price", methods=["GET"])
+async def product_price_endpoint():
+    """Return the cheapest product price for a given site via fetch_products()."""
+    site      = request.args.get("site")
+    proxy_str = request.args.get("proxy")
+
+    if not site:
+        return jsonify({"error": "Missing 'site' parameter"}), 400
+
+    result = await fetch_products(site, proxy_str)
+    if isinstance(result, tuple) and result[0] is False:
+        return jsonify({"error": str(result[1])}), 400
+
+    try:
+        price = float(result.get("price", "0"))
+    except (ValueError, TypeError):
+        price = 0.0
+
+    return jsonify({
+        "price":      price,
+        "variant_id": result.get("variant_id"),
+        "site":       site,
+    })
+
+
 @app.route("/shopify", methods=["GET"])
 async def shopify_checker():
     try:

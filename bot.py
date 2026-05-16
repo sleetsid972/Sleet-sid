@@ -27,6 +27,7 @@ API_ENDPOINTS = [
     (ep.rstrip('/') + '/shopify') if not ep.rstrip('/').endswith('/shopify') else ep
     for ep in (x.strip() for x in os.getenv('API_ENDPOINTS', '').split(',') if x.strip())
 ]
+MASS_CHECK_WORKERS = int(os.getenv('MASS_CHECK_WORKERS', '20'))
 
 REQUIRED_CHATS = [
     {"link": "https://t.me/hexaxcheckerupdates", "id": None},
@@ -144,6 +145,27 @@ async def call_checker_api(params, max_tries=3):
         except Exception as e:
             last_exc = e
     raise Exception(f"All API endpoints failed: {last_exc}")
+
+
+async def call_product_price_api(site: str, max_tries: int = 2) -> dict:
+    """Call /product_price on a healthy API endpoint (load-balanced)."""
+    last_exc = None
+    for _ in range(max_tries):
+        try:
+            shopify_ep = await get_next_healthy_endpoint()
+            # Derive /product_price URL from the /shopify endpoint
+            if shopify_ep.endswith('/shopify'):
+                ep = shopify_ep[:-len('/shopify')] + '/product_price'
+            else:
+                ep = shopify_ep.rstrip('/') + '/product_price'
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(ep, params={'site': site}) as resp:
+                    body = await resp.text()
+                    return json.loads(body)
+        except Exception as e:
+            last_exc = e
+    raise Exception(f"product_price API failed: {last_exc}")
 
 # ========== SQLITE CREDITS ==========
 _credits_lock = asyncio.Lock()
@@ -494,51 +516,19 @@ _site_price_cache: dict = {}   # {site_url: (timestamp, min_price_or_none)}
 _PRICE_CACHE_TTL = 3600        # 1 hour
 
 async def _fetch_cheapest_price(site_url: str) -> float | None:
-    """Fetch cheapest available product price for site_url.
-    Retries with up to 3 fastest proxies. Returns None on failure."""
+    """Fetch cheapest available product price via the API's /product_price endpoint.
+    Uses the same load-balanced, health-aware API pool as card checks."""
     domain = site_url if site_url.startswith("http") else f"https://{site_url}"
-    proxies_pool = load_proxies()
-    candidates = _choose_fastest_proxies(proxies_pool, n=3) if proxies_pool else [None]
-    if not candidates:
-        candidates = [None]
-
-    from curl_cffi.requests import AsyncSession as _AS
-    for proxy_str in candidates:
-        try:
-            proxies_dict = _make_proxy_dict(proxy_str) if proxy_str else {}
-            async with _AS(impersonate="chrome120", verify=False) as session:
-                t0 = time.time()
-                resp = await session.get(
-                    f"{domain}/products.json",
-                    proxies=proxies_dict or None,
-                    timeout=15,
-                )
-                elapsed_ms = (time.time() - t0) * 1000
-                if proxy_str:
-                    # Update speed cache with exponential moving average
-                    prev = _proxy_speed_cache.get(proxy_str)
-                    _proxy_speed_cache[proxy_str] = (
-                        elapsed_ms if prev is None else 0.7 * prev + 0.3 * elapsed_ms
-                    )
-                if resp.status_code != 200:
-                    continue
-                data = json.loads(resp.text)
-                products = data.get("products", [])
-                min_price = None
-                for product in products:
-                    for variant in product.get("variants", []):
-                        if not variant.get("available", True):
-                            continue
-                        try:
-                            p = float(str(variant.get("price", "0")).replace(",", ""))
-                            if min_price is None or p < min_price:
-                                min_price = p
-                        except (ValueError, TypeError):
-                            continue
-                return min_price
-        except Exception:
-            continue
-    return None
+    try:
+        result = await call_product_price_api(domain)
+        if "error" in result:
+            return None
+        price = result.get("price")
+        if price is not None:
+            return float(price)
+        return None
+    except Exception:
+        return None
 
 async def get_site_cheapest_price(site_url: str) -> float | None:
     """Return cached cheapest price or fetch if stale/missing."""
@@ -883,18 +873,28 @@ async def test_proxy(proxy):
     try:
         t0 = time.time()
         params = {'cc': test_card, 'site': test_site_url, 'proxy': proxy}
-        raw = await call_checker_api(params)
+        # Use a short timeout so dead proxies fail fast (full checkout is ≤30 s)
+        raw = await asyncio.wait_for(call_checker_api(params), timeout=30)
         elapsed_ms = (time.time() - t0) * 1000
-        response_msg = raw.get('Response', '').lower()
-        if 'proxy dead' in response_msg or 'invalid proxy format' in response_msg or 'no proxy' in response_msg:
+        # A valid response must carry a Status key (True = Approved, False = Dead)
+        if 'Status' not in raw:
             return {'proxy': proxy, 'status': 'dead'}
-        # Record speed only for alive proxies
+        response_msg = (raw.get('Response', '') or raw.get('error', '')).lower()
+        gateway_msg  = (raw.get('Gateway', '') or '').lower()
+        # Detect proxy-specific failures surfaced by the API
+        proxy_keywords = (
+            'proxy dead', 'proxy error', 'invalid proxy format', 'no proxy',
+            'proxy', 'socks', '407', 'tunnel connection failed',
+        )
+        if any(kw in response_msg or kw in gateway_msg for kw in proxy_keywords):
+            return {'proxy': proxy, 'status': 'dead'}
+        # Record speed for alive proxies
         prev = _proxy_speed_cache.get(proxy)
         _proxy_speed_cache[proxy] = (
             elapsed_ms if prev is None else 0.7 * prev + 0.3 * elapsed_ms
         )
         return {'proxy': proxy, 'status': 'alive'}
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         return {'proxy': proxy, 'status': 'dead'}
 
 # ========== PROGRESS / RESULTS ==========
@@ -1824,7 +1824,7 @@ async def broadcast_admin(event):
     await status_msg.edit(premium_emoji(f"✅ <b>Broadcast Complete!</b>\n\nSent: {sent}\nFailed: {failed}"), parse_mode='html')
 
 # ========== SINGLE CC CHECK ==========
-_api_semaphore = asyncio.Semaphore(10)
+_api_semaphore = asyncio.Semaphore(MASS_CHECK_WORKERS)
 
 @bot.on(events.NewMessage(pattern=r'^/cc\s+'))
 async def single_cc_check(event):
@@ -2103,7 +2103,7 @@ async def check_command(event):
                 if all_results['checked'] >= total_cards and result_queue.empty():
                     break
 
-        worker_tasks  = [asyncio.create_task(worker()) for _ in range(10)]
+        worker_tasks  = [asyncio.create_task(worker()) for _ in range(MASS_CHECK_WORKERS)]
         updater_task  = asyncio.create_task(updater())
 
         # Wait for all workers
