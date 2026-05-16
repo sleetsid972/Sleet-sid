@@ -15,6 +15,7 @@ from queries import (
 )
 
 MIN_PRODUCT_PRICE = 5.0
+DEFAULT_GATEWAY = "Shopify Payments"
 
 C2C = {
     "USD": "US",
@@ -1150,7 +1151,7 @@ async def shopify_checker():
 
         # Normalise gateway: never expose "UNKNOWN" to the bot
         if not gateway or gateway.upper() in ("UNKNOWN", ""):
-            gateway = "Shopify Payments"
+            gateway = DEFAULT_GATEWAY
 
         try:
             price_float = float(price) if str(price).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.0
