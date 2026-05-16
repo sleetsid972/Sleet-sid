@@ -308,6 +308,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if isinstance(info, tuple) and info[0] is False:
                 return False, info[1], gateway, total_price, currency
             variant_id = info["variant_id"]
+            # Store product price so error paths after this point never return 0.00
+            total_price = info.get("price", total_price)
 
         async with AsyncSession(impersonate="chrome120", verify=False) as session:
             url      = ourl

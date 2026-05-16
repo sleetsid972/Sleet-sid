@@ -23,7 +23,10 @@ BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_IDS = [int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
 PVT_CHANNEL_ID = int(os.getenv('PVT_CHANNEL_ID', '0'))
 DB_FILE = os.getenv('DB_FILE', 'credits.db')
-API_ENDPOINTS = [x.strip() for x in os.getenv('API_ENDPOINTS', '').split(',') if x.strip()]
+API_ENDPOINTS = [
+    (ep.rstrip('/') + '/shopify') if not ep.rstrip('/').endswith('/shopify') else ep
+    for ep in (x.strip() for x in os.getenv('API_ENDPOINTS', '').split(',') if x.strip())
+]
 
 REQUIRED_CHATS = [
     {"link": "https://t.me/hexaxcheckerupdates", "id": None},
@@ -82,6 +85,9 @@ def premium_emoji(text):
 bot = TelegramClient('hexaxshchkrx_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 active_sessions = {}
 ACTIVE_FILTER = "all"
+_cache_warmup_in_progress = False
+_cache_warmup_total = 0
+_cache_warmup_done = 0
 
 # ========== HEALTH-AWARE LOAD BALANCER ==========
 _healthy_endpoints: set = set()
@@ -123,7 +129,18 @@ async def call_checker_api(params, max_tries=3):
             timeout = aiohttp.ClientTimeout(total=120)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(ep, params=params) as resp:
-                    return await resp.json(content_type=None)
+                    body = await resp.text()
+                    if resp.status >= 400:
+                        body_stripped = body.strip()
+                        if body_stripped.startswith('<'):
+                            raise Exception(f"Endpoint returned HTML (HTTP {resp.status})")
+                        raise Exception(f"HTTP {resp.status}: {body_stripped[:120]}")
+                    try:
+                        return json.loads(body)
+                    except json.JSONDecodeError:
+                        if body.strip().startswith('<'):
+                            raise Exception("Endpoint returned HTML instead of JSON")
+                        raise Exception(f"Invalid JSON response: {body[:120]}")
         except Exception as e:
             last_exc = e
     raise Exception(f"All API endpoints failed: {last_exc}")
@@ -496,8 +513,8 @@ async def get_site_cheapest_price(site_url: str) -> float | None:
     return price
 
 async def load_filtered_sites() -> list:
-    """Return sites from SITES_FILE filtered by the active price filter.
-    Sites with an unknown price (not yet cached) are included conservatively."""
+    """Return only sites whose price is cached and within the active filter range.
+    When a non-'all' filter is active, uncached or out-of-range sites are excluded."""
     all_sites = load_sites()
     if ACTIVE_FILTER == "all":
         return all_sites
@@ -505,26 +522,51 @@ async def load_filtered_sites() -> list:
     min_p, max_p = flt["min"], flt["max"]
     filtered = []
     for site in all_sites:
-        price = _site_price_cache.get(site)
-        if price is None:
-            # Not cached yet — include by default so no sites are silently dropped
-            filtered.append(site)
-            continue
-        cached_ts, cached_price = price
-        if cached_price is None:
-            # Unknown price — include conservatively
-            filtered.append(site)
-        elif min_p <= cached_price <= max_p:
+        cached = _site_price_cache.get(site)
+        if cached is None:
+            continue  # skip: price not yet cached
+        _, cached_price = cached
+        if cached_price is not None and min_p <= cached_price <= max_p:
             filtered.append(site)
     return filtered
 
-async def warm_price_cache(sites: list):
+async def warm_price_cache(sites: list, notify_chat_id: int = None):
     """Background task: fetch cheapest price for all sites and populate cache."""
-    batch = 5
+    global _cache_warmup_in_progress, _cache_warmup_total, _cache_warmup_done
+    _cache_warmup_in_progress = True
+    _cache_warmup_total = len(sites)
+    _cache_warmup_done = 0
+
+    batch = 10
     for i in range(0, len(sites), batch):
         tasks = [get_site_cheapest_price(s) for s in sites[i:i+batch]]
         await asyncio.gather(*tasks, return_exceptions=True)
+        _cache_warmup_done = min(i + batch, len(sites))
         await asyncio.sleep(0.5)
+
+    _cache_warmup_done = _cache_warmup_total
+    _cache_warmup_in_progress = False
+
+    if notify_chat_id:
+        flt = SITE_FILTERS[ACTIVE_FILTER]
+        min_p, max_p = flt["min"], flt["max"]
+        matched = sum(
+            1 for site in sites
+            if site in _site_price_cache
+            and _site_price_cache[site][1] is not None
+            and min_p <= _site_price_cache[site][1] <= max_p
+        )
+        try:
+            await bot.send_message(
+                notify_chat_id,
+                premium_emoji(
+                    f"✅ <b>Cache ready!</b> <b>{matched}</b> sites match "
+                    f"<b>{flt['name']}</b>. You can now check cards."
+                ),
+                parse_mode='html',
+            )
+        except Exception:
+            pass
 
 def add_site(site_url):
     sites = load_sites()
@@ -1168,8 +1210,56 @@ async def filter_command(event):
 
     ACTIVE_FILTER = filter_key
     all_sites = load_sites()
-    asyncio.create_task(warm_price_cache(all_sites))
-    await event.reply(premium_emoji(f"✅ <b>Filter Updated!</b>\n\nNow using: {SITE_FILTERS[ACTIVE_FILTER]['name']}\n🔄 Warming up price cache for {len(all_sites)} sites in background..."), parse_mode='html')
+
+    if filter_key == "all":
+        await event.reply(premium_emoji(f"✅ <b>Filter set to:</b> {SITE_FILTERS[ACTIVE_FILTER]['name']}\n\nAll sites will be used."), parse_mode='html')
+        return
+
+    asyncio.create_task(warm_price_cache(all_sites, notify_chat_id=event.chat_id))
+    await event.reply(premium_emoji(
+        f"✅ <b>Filter set to:</b> {SITE_FILTERS[filter_key]['name']}\n\n"
+        f"🔄 Warming up price cache for <b>{len(all_sites)}</b> sites.\n"
+        f"Checks will use only sites whose price is cached and within the filter.\n"
+        f"You'll be notified here when warmup completes.\n\n"
+        f"Use /cachestatus to track progress."
+    ), parse_mode='html')
+
+# ========== ADMIN - CACHE STATUS ==========
+
+@bot.on(events.NewMessage(pattern='/cachestatus'))
+async def cache_status_command(event):
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        return await event.reply(premium_emoji("❌ <b>Admin only command!</b>"), parse_mode='html')
+
+    all_sites = load_sites()
+    total = len(all_sites)
+    cached_count = sum(1 for s in all_sites if s in _site_price_cache)
+    remaining = total - cached_count
+
+    flt = SITE_FILTERS[ACTIVE_FILTER]
+    min_p, max_p = flt["min"], flt["max"]
+    matched = sum(
+        1 for s in all_sites
+        if s in _site_price_cache
+        and _site_price_cache[s][1] is not None
+        and min_p <= _site_price_cache[s][1] <= max_p
+    )
+
+    warmup_status = "🔄 In progress" if _cache_warmup_in_progress else "✅ Idle"
+    progress_info = ""
+    if _cache_warmup_in_progress and _cache_warmup_total > 0:
+        progress_info = f"\n📊 Progress: {_cache_warmup_done}/{_cache_warmup_total}"
+
+    await event.reply(premium_emoji(
+        f"<b>📊 Cache Status</b>\n\n"
+        f"🎯 Active Filter: <b>{flt['name']}</b>\n"
+        f"🔄 Warmup: {warmup_status}{progress_info}\n\n"
+        f"📦 Total sites: <b>{total}</b>\n"
+        f"✅ Cached: <b>{cached_count}</b>\n"
+        f"⏳ Uncached: <b>{remaining}</b>\n"
+        f"🎯 Matching filter: <b>{matched}</b>"
+    ), parse_mode='html')
 
 # ========== ADMIN - API STATUS ==========
 
@@ -1698,6 +1788,10 @@ async def single_cc_check(event):
     proxies = load_proxies()
 
     if not sites:
+        if ACTIVE_FILTER != "all" and _cache_warmup_in_progress:
+            return await event.reply(premium_emoji("⏳ <b>Price cache is warming up.</b>\n\nNo sites are cached yet for the active filter. Please wait a moment and try again.\nUse /cachestatus to check progress."), parse_mode='html')
+        elif ACTIVE_FILTER != "all":
+            return await event.reply(premium_emoji("⏳ <b>No sites meet the active price filter.</b>\n\nUse /filter to change the filter, or run /filter again to start a fresh cache warmup."), parse_mode='html')
         return await event.reply(premium_emoji("❌ No sites available. Contact admin."), parse_mode='html')
     if not proxies:
         return await event.reply(premium_emoji("❌ No proxies available. Contact admin."), parse_mode='html')
@@ -1827,6 +1921,10 @@ async def check_command(event):
     filter_info = f"🎯 Filter: {SITE_FILTERS[ACTIVE_FILTER]['name']}"
     filtered_sites = await load_filtered_sites()
     if not filtered_sites:
+        if ACTIVE_FILTER != "all" and _cache_warmup_in_progress:
+            return await status_msg.edit(premium_emoji("⏳ <b>Price cache is warming up.</b>\n\nNo sites are cached yet for the active filter. Please wait and try again.\nUse /cachestatus to track progress."), parse_mode='html')
+        elif ACTIVE_FILTER != "all":
+            return await status_msg.edit(premium_emoji("⏳ <b>No sites meet the active price filter.</b>\n\nUse /filter to change the filter or run /filter again to start warmup."), parse_mode='html')
         return await status_msg.edit(premium_emoji("❌ No sites match the active price filter. Use /filter to change the filter or /addsite to add sites."), parse_mode='html')
 
     await status_msg.edit(premium_emoji(f"🫦 Starting check for {total_cards} cards...\n{filter_info}\n💰 Credits: {user_credits} (Will deduct 1 per card)"), parse_mode='html')
