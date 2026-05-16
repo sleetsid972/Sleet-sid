@@ -584,7 +584,7 @@ async def check_card(card, site, proxy):
 
         # Map new API boolean Status + Response to internal statuses
         if api_status is True or api_status == 'True' or api_status == 'true':
-            if response_msg == 'ORDER_PLACED' or 'order_placed' in response_lower or 'order completed' in response_lower or 'thank you' in response_lower or 'payment successful' in response_lower:
+            if 'order_placed' in response_lower or 'order completed' in response_lower or 'thank you' in response_lower or 'payment successful' in response_lower:
                 return {'status': 'Charged', 'message': response_msg, 'card': card, 'site': site, 'gateway': gateway, 'price': price}
             else:
                 # Live card (3DS_REQUIRED, INSUFFICIENT_FUNDS, etc.)
@@ -1633,7 +1633,7 @@ async def check_command(event):
         
         last_update_count = 0
         UPDATE_EVERY_CARDS = 10
-        api_semaphore = asyncio.Semaphore(5)
+        api_semaphore = asyncio.Semaphore(5)  # max 5 concurrent API calls to avoid overwhelming VPS endpoints
         
         async def worker():
             nonlocal last_update_count
