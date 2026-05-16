@@ -2495,7 +2495,7 @@ async def stop_handler(event):
         if stop_ev:
             stop_ev.set()
     await event.answer(premium_emoji("🛑 Stopped"))
-    await event.edit(premium_emoji("😡 **Checking stopped by user.**"))
+    await event.edit(premium_emoji("😡 <b>Checking stopped by user.</b>"), parse_mode='html')
 
 # ========== STARTUP ==========
 async def main():
