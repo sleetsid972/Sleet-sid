@@ -1104,17 +1104,17 @@ async def health():
 
 @app.route("/workers")
 async def worker_count():
-    """Return the number of active hypercorn worker processes."""
+    """Return the number of active hypercorn worker processes (children of this master)."""
     import subprocess
+    import os
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "hypercorn"],
+        pid = os.getpid()
+        child = subprocess.run(
+            ["pgrep", "-P", str(pid)],
             capture_output=True, text=True, timeout=3
         )
-        pids = [p.strip() for p in result.stdout.strip().splitlines() if p.strip()]
-        # Subtract 1 for the master/current process itself
-        count = max(0, len(pids) - 1)
-        return jsonify({"workers": count})
+        pids = [p.strip() for p in child.stdout.strip().splitlines() if p.strip()]
+        return jsonify({"workers": len(pids)})
     except Exception:
         return jsonify({"workers": "unknown"})
 
