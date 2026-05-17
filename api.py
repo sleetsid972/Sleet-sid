@@ -1124,19 +1124,29 @@ async def health():
 
 @app.route("/workers")
 async def worker_count():
-    """Return the number of active hypercorn worker processes (children of this master)."""
-    import subprocess
-    import os
+    """Return the configured worker count from the -w / --workers sys.argv flag."""
+    import sys
     try:
+        argv = sys.argv
+        # Look for -w <n> or --workers <n>
+        for flag in ('-w', '--workers'):
+            if flag in argv:
+                idx = argv.index(flag) + 1
+                if idx < len(argv):
+                    return jsonify({"workers": int(argv[idx])})
+        # Fallback: count running child processes of this master
+        import subprocess, os
         pid = os.getpid()
         child = subprocess.run(
             ["pgrep", "-P", str(pid)],
             capture_output=True, text=True, timeout=3
         )
         pids = [p.strip() for p in child.stdout.strip().splitlines() if p.strip()]
-        return jsonify({"workers": len(pids)})
+        if pids:
+            return jsonify({"workers": len(pids)})
     except Exception:
-        return jsonify({"workers": "unknown"})
+        pass
+    return jsonify({"workers": "unknown"})
 
 
 @app.route("/product_price", methods=["GET"])

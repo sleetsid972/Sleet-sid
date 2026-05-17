@@ -886,51 +886,61 @@ async def check_card_with_retry(card, sites, proxies, max_retries=2):
 
 # ========== SITE / PROXY TESTERS ==========
 async def test_site(site, proxy):
-    test_card = "5154623245618097|03|2032|156"
+    # Use a well-known Luhn-valid dead test card so the checkout always
+    # reaches the payment step but gets declined immediately.
+    test_card = "4111111111111111|12|2028|123"
+    # Prefer the fastest known proxy for the test to minimise latency.
+    proxies_pool = load_proxies()
+    fastest = _choose_fastest_proxies(proxies_pool, n=1)
+    test_proxy_str = fastest[0] if fastest else proxy
     try:
-        params = {'cc': test_card, 'site': site, 'proxy': proxy}
-        raw = await call_checker_api(params)
-        response_msg = raw.get('Response', '').lower()
+        params = {'cc': test_card, 'site': site, 'proxy': test_proxy_str}
+        # Strict 10-second budget: if the site doesn't respond in time it's dead.
+        raw = await asyncio.wait_for(call_checker_api(params), timeout=10)
+        # Must be a proper API response carrying a Status field.
+        if 'Status' not in raw:
+            return {'site': site, 'status': 'dead'}
+        response_msg = (raw.get('Response', '') or '').lower()
+        # NO_PRODUCT_IN_PRICE_RANGE means the site has no usable product.
+        if 'no_product_in_price_range' in response_msg:
+            return {'site': site, 'status': 'dead'}
         if is_dead_site_error(response_msg):
             return {'site': site, 'status': 'dead'}
         return {'site': site, 'status': 'alive'}
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         return {'site': site, 'status': 'dead'}
 
 async def test_proxy(proxy):
-    test_card = "5154623245618097|03|2032|156"
+    test_card = "4111111111111111|12|2028|123"
     test_site_url = "https://riverbendhomedev.myshopify.com"
     try:
         t0 = time.time()
         params = {'cc': test_card, 'site': test_site_url, 'proxy': proxy}
-        # 10-second window: dead proxies return an error quickly; live proxies
-        # will be mid-checkout (15-30 s) when the timeout fires.
+        # 10-second hard limit: a proxy that doesn't produce a valid response
+        # within 10 s (whether it hangs, is misconfigured, or is a dead server)
+        # is considered dead.
         raw = await asyncio.wait_for(call_checker_api(params), timeout=10)
         elapsed_ms = (time.time() - t0) * 1000
-        # A valid response must carry a Status key (True = Approved/Dead, False = error)
+        # A valid response must carry a Status key.
         if 'Status' not in raw:
             return {'proxy': proxy, 'status': 'dead'}
         response_msg = (raw.get('Response', '') or raw.get('error', '')).lower()
         gateway_msg  = (raw.get('Gateway', '') or '').lower()
-        # Detect proxy-specific failures surfaced by the API
+        # Detect proxy-specific failures surfaced by the API.
         proxy_keywords = (
             'proxy dead', 'proxy error', 'invalid proxy format', 'no proxy',
             '407', 'tunnel connection failed',
         )
         if any(kw in response_msg or kw in gateway_msg for kw in proxy_keywords):
             return {'proxy': proxy, 'status': 'dead'}
-        # Record speed for alive proxies
+        # Record speed for alive proxies.
         prev = _proxy_speed_cache.get(proxy)
         _proxy_speed_cache[proxy] = (
             elapsed_ms if prev is None else 0.7 * prev + 0.3 * elapsed_ms
         )
         return {'proxy': proxy, 'status': 'alive'}
-    except asyncio.TimeoutError:
-        # Timeout means the checkout is still processing → proxy is alive and
-        # responding. Record a high latency so the bot prefers faster proxies.
-        _proxy_speed_cache[proxy] = _proxy_speed_cache.get(proxy, 10000)
-        return {'proxy': proxy, 'status': 'alive'}
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
+        # Timeout or any exception means the proxy is unresponsive → dead.
         return {'proxy': proxy, 'status': 'dead'}
 
 # ========== PROGRESS / RESULTS ==========
