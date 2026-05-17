@@ -708,6 +708,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             total_price = str(float(running_total) + shipping_amount + tax_amount)
                             break
 
+            # Fallback: if checkout totals resolved to zero (e.g. running_total
+            # was never extracted from the GraphQL response), use product_price so
+            # True-path returns (CARD_DECLINED, ORDER_PLACED, etc.) never show 0.0.
+            if float(total_price or "0") == 0.0 and product_price not in ("0.00", "0.0"):
+                total_price = product_price
+
             if not payment_identifier:
                 return False, "No valid payment method found", gateway, product_price if product_price != "0.00" else total_price, currency
 
