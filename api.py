@@ -1134,16 +1134,6 @@ async def worker_count():
                 idx = argv.index(flag) + 1
                 if idx < len(argv):
                     return jsonify({"workers": int(argv[idx])})
-        # Fallback: count running child processes of this master
-        import subprocess, os
-        pid = os.getpid()
-        child = subprocess.run(
-            ["pgrep", "-P", str(pid)],
-            capture_output=True, text=True, timeout=3
-        )
-        pids = [p.strip() for p in child.stdout.strip().splitlines() if p.strip()]
-        if pids:
-            return jsonify({"workers": len(pids)})
     except Exception:
         pass
     return jsonify({"workers": "unknown"})
